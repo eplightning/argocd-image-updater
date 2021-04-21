@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/argoproj-labs/argocd-image-updater/pkg/webhook"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -27,8 +28,6 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/semaphore"
 )
-
-var lastRun time.Time
 
 // Default ArgoCD server address when running in same cluster as ArgoCD
 const defaultArgoCDServerAddr = "argocd-server.argocd"
@@ -55,6 +54,7 @@ type ImageUpdaterConfig struct {
 	MaxConcurrency      int
 	HealthPort          int
 	MetricsPort         int
+	WebhookPort         int
 	RegistriesConf      string
 	AppNamePatterns     []string
 	GitCommitUser       string
@@ -461,6 +461,7 @@ func newRunCommand() *cobra.Command {
 			if once {
 				cfg.CheckInterval = 0
 				cfg.HealthPort = 0
+				cfg.WebhookPort = 0
 			}
 
 			// Enforce sane --max-concurrency values
@@ -551,9 +552,12 @@ func newRunCommand() *cobra.Command {
 				cfg.ClientOpts.Plaintext,
 			)
 
+			trigger := webhook.NewUpdateTrigger(cfg.CheckInterval)
+
 			// Health server will start in a go routine and run asynchronously
 			var hsErrCh chan error
 			var msErrCh chan error
+			var wsErrCh chan error
 			if cfg.HealthPort > 0 {
 				log.Infof("Starting health probe server TCP port=%d", cfg.HealthPort)
 				hsErrCh = health.StartHealthServer(cfg.HealthPort)
@@ -564,6 +568,11 @@ func newRunCommand() *cobra.Command {
 				msErrCh = metrics.StartMetricsServer(cfg.MetricsPort)
 			}
 
+			if cfg.WebhookPort > 0 {
+				log.Infof("Starting webhook server on TCP port=%d", cfg.WebhookPort)
+				wsErrCh = webhook.StartWebhookServer(cfg.WebhookPort, trigger)
+			}
+
 			if warmUpCache {
 				err := warmupImageCache(cfg)
 				if err != nil {
@@ -571,6 +580,8 @@ func newRunCommand() *cobra.Command {
 					return err
 				}
 			}
+
+			listener := trigger.Listen()
 
 			// This is our main loop. We leave it only when our health probe server
 			// returns an error.
@@ -590,26 +601,29 @@ func newRunCommand() *cobra.Command {
 						log.Infof("Metrics server exited gracefully")
 					}
 					return nil
-				default:
-					if lastRun.IsZero() || time.Since(lastRun) > cfg.CheckInterval {
-						result, err := runImageUpdater(cfg, false)
-						if err != nil {
-							log.Errorf("Error: %v", err)
-						} else {
-							log.Infof("Processing results: applications=%d images_considered=%d images_skipped=%d images_updated=%d errors=%d",
-								result.NumApplicationsProcessed,
-								result.NumImagesConsidered,
-								result.NumSkipped,
-								result.NumImagesUpdated,
-								result.NumErrors)
-						}
-						lastRun = time.Now()
+				case err := <-wsErrCh:
+					if err != nil {
+						log.Errorf("Webhook server exited with error: %v", err)
+					} else {
+						log.Infof("Webhook server exited gracefully")
+					}
+					return nil
+				case <-listener:
+					result, err := runImageUpdater(cfg, false)
+					if err != nil {
+						log.Errorf("Error: %v", err)
+					} else {
+						log.Infof("Processing results: applications=%d images_considered=%d images_skipped=%d images_updated=%d errors=%d",
+							result.NumApplicationsProcessed,
+							result.NumImagesConsidered,
+							result.NumSkipped,
+							result.NumImagesUpdated,
+							result.NumErrors)
 					}
 				}
 				if cfg.CheckInterval == 0 {
 					break
 				}
-				time.Sleep(100 * time.Millisecond)
 			}
 			log.Infof("Finished.")
 			return nil
@@ -628,6 +642,7 @@ func newRunCommand() *cobra.Command {
 	runCmd.Flags().StringVar(&kubeConfig, "kubeconfig", "", "full path to kubernetes client configuration, i.e. ~/.kube/config")
 	runCmd.Flags().IntVar(&cfg.HealthPort, "health-port", 8080, "port to start the health server on, 0 to disable")
 	runCmd.Flags().IntVar(&cfg.MetricsPort, "metrics-port", 8081, "port to start the metrics server on, 0 to disable")
+	runCmd.Flags().IntVar(&cfg.WebhookPort, "webhook-port", 8082, "port to start the webhook server on, 0 to disable")
 	runCmd.Flags().BoolVar(&once, "once", false, "run only once, same as specifying --interval=0 and --health-port=0")
 	runCmd.Flags().StringVar(&cfg.RegistriesConf, "registries-conf-path", defaultRegistriesConfPath, "path to registries configuration file")
 	runCmd.Flags().BoolVar(&disableKubernetes, "disable-kubernetes", false, "do not create and use a Kubernetes client")
